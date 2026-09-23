@@ -940,7 +940,7 @@ func (s *Service) signalling(w http.ResponseWriter, r *http.Request) {
 			case targetPeer.send <- raw:
 			default:
 			}
-		} else {
+		} else if msg.Type == "session.requested" {
 			offlineMsg, _ := json.Marshal(map[string]any{
 				"type":      "session.updated",
 				"state":     "offline",
