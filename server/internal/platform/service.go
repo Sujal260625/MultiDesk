@@ -832,12 +832,12 @@ func (s *Service) signalling(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	conn.SetReadLimit(64 * 1024)
+	conn.SetReadLimit(32 * 1024 * 1024)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	p := &peer{conn, make(chan []byte, 128)}
+	p := &peer{conn, make(chan []byte, 512)}
 	s.mu.Lock()
 	if old := s.peers[normID]; old != nil {
 		_ = old.socket.Close(websocket.StatusNormalClosure, "replaced by new session")
