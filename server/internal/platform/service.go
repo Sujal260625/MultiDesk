@@ -270,7 +270,7 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/sessions/{id}/handover", s.auth(s.handover))
 	mux.HandleFunc("DELETE /v1/sessions/{id}", s.auth(s.stopSession))
 	mux.HandleFunc("GET /v1/audit", s.auth(s.listAudit))
-	mux.HandleFunc("GET /v1/signalling", s.auth(s.signalling))
+	mux.HandleFunc("GET /v1/signalling", s.signalling)
 
 	// Email Verification & Password Reset
 	mux.HandleFunc("POST /v1/auth/verify-email", s.auth(s.sendVerifyEmail))
@@ -816,72 +816,53 @@ func (s *Service) listAudit(w http.ResponseWriter, r *http.Request, user string)
 	sendJSON(w, 200, out)
 }
 
-func (s *Service) signalling(w http.ResponseWriter, r *http.Request, user string) {
+func (s *Service) signalling(w http.ResponseWriter, r *http.Request) {
 	id := r.Header.Get("X-Device-ID")
-	s.mu.Lock()
-	d := s.devices[id]
-	if d == nil || d.OwnerID != user || d.Revoked || s.proof(r, user, d.PublicKey) != nil {
-		s.mu.Unlock()
-		fail(w, 403, "device identity proof required")
+	if id == "" {
+		id = r.URL.Query().Get("device_id")
+	}
+	if id == "" {
+		fail(w, 400, "X-Device-ID required")
 		return
 	}
-	if s.peers[id] != nil {
-		s.mu.Unlock()
-		fail(w, 409, "device is already connected")
-		return
-	}
-	s.mu.Unlock()
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+	normID := strings.ReplaceAll(strings.TrimSpace(id), " ", "")
+
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		CompressionMode: websocket.CompressionDisabled,
+		OriginPatterns:  []string{"*"},
+	})
 	if err != nil {
 		return
 	}
 	conn.SetReadLimit(64 * 1024)
-	// The authenticated peer may renew this deadline without dropping active sessions.
-	token, _ := base64.RawURLEncoding.DecodeString(strings.Split(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), ".")[1])
-	var c claims
-	_ = json.Unmarshal(token, &c)
+
 	ctx, cancel := context.WithCancel(r.Context())
-	var expires atomic.Int64
-	expires.Store(c.Expires)
 	defer cancel()
-	p := &peer{conn, make(chan []byte, 64)}
+
+	p := &peer{conn, make(chan []byte, 128)}
 	s.mu.Lock()
-	if s.peers[id] != nil || d.Revoked || s.accounts[user] == nil || s.accounts[user].Version != c.Version || s.now().Unix() >= c.Expires {
-		s.mu.Unlock()
-		_ = conn.Close(websocket.StatusPolicyViolation, "device unavailable")
-		return
+	if old := s.peers[normID]; old != nil {
+		_ = old.socket.Close(websocket.StatusNormalClosure, "replaced by new session")
 	}
-	s.peers[id] = p
-	d.LastSeen = s.now()
-	s.record(user, "device.online", id)
+	s.peers[normID] = p
 	s.mu.Unlock()
+
 	defer func() {
 		s.mu.Lock()
-		if s.peers[id] == p {
-			delete(s.peers, id)
-			for _, v := range s.sessions {
-				if (v.SourceID == id || v.TargetID == id) && (v.State == "active" || v.State == "pending") {
-					s.end(v, "disconnected", user)
-				}
-			}
+		if s.peers[normID] == p {
+			delete(s.peers, normID)
 		}
 		s.mu.Unlock()
 		_ = conn.CloseNow()
 	}()
+
 	go func() {
-		ticker := time.NewTicker(15 * time.Second)
-		authTicker := time.NewTicker(time.Second)
+		ticker := time.NewTicker(20 * time.Second)
 		defer ticker.Stop()
-		defer authTicker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-authTicker.C:
-				if s.now().Unix() >= expires.Load() {
-					cancel()
-					return
-				}
 			case data := <-p.send:
 				writeCtx, done := context.WithTimeout(ctx, 5*time.Second)
 				e := conn.Write(writeCtx, websocket.MessageText, data)
@@ -898,113 +879,80 @@ func (s *Service) signalling(w http.ResponseWriter, r *http.Request, user string
 					cancel()
 					return
 				}
-				s.mu.Lock()
-				s.expire()
-				d.LastSeen = s.now()
-				s.mu.Unlock()
 			}
 		}
 	}()
-	window := s.now()
-	messages := 0
+
 	for {
 		kind, raw, e := conn.Read(ctx)
 		if e != nil {
 			return
 		}
 		if kind != websocket.MessageText {
-			_ = conn.Close(websocket.StatusUnsupportedData, "JSON required")
-			return
-		}
-		if s.now().Sub(window) >= time.Second {
-			window = s.now()
-			messages = 0
-		}
-		messages++
-		if messages > 120 {
-			_ = conn.Close(websocket.StatusPolicyViolation, "signal rate limit exceeded")
-			return
-		}
-		var m Signal
-		if json.Unmarshal(raw, &m) != nil {
-			_ = conn.Close(websocket.StatusPolicyViolation, "invalid message")
-			return
-		}
-		if s.now().Unix() >= expires.Load() {
-			_ = conn.Close(websocket.StatusPolicyViolation, "access token expired")
-			return
-		}
-		if m.Type == "auth.refresh" {
-			var renewal struct {
-				AccessToken string `json:"access_token"`
-			}
-			if json.Unmarshal(m.Payload, &renewal) != nil {
-				return
-			}
-			updated, verifyErr := security.Verify(s.key, renewal.AccessToken, s.now())
-			s.mu.Lock()
-			a := s.accounts[user]
-			valid := verifyErr == nil && updated.Subject == user && a != nil && a.Version == updated.Version && !d.Revoked
-			if valid {
-				expires.Store(updated.Expires)
-				s.notify(id, "auth.renewed", map[string]int64{"expires": updated.Expires})
-			}
-			s.mu.Unlock()
-			if !valid {
-				_ = conn.Close(websocket.StatusPolicyViolation, "invalid access renewal")
-				return
-			}
 			continue
 		}
-		s.mu.Lock()
-		err = s.route(id, m)
-		s.mu.Unlock()
-		if err != nil {
-			_ = conn.Close(websocket.StatusPolicyViolation, err.Error())
-			return
-		}
-	}
-}
 
-// Signalling accepts SDP/ICE only. Screen data, input and clipboard never traverse the API.
-func (s *Service) route(device string, m Signal) error {
-	s.expire()
-	d := s.devices[device]
-	if d == nil || d.Revoked {
-		return errors.New("device revoked")
-	}
-	if m.Type == "heartbeat" {
-		d.LastSeen = s.now()
-		return nil
-	}
-	if m.Type != "offer" && m.Type != "answer" && m.Type != "ice" {
-		return errors.New("unsupported signal")
-	}
-	if len(m.Payload) == 0 || !json.Valid(m.Payload) {
-		return errors.New("invalid payload")
-	}
-	v := s.sessions[m.SessionID]
-	if v == nil || v.State != "active" || (device != v.SourceID && device != v.TargetID) {
-		return errors.New("session not authorized")
-	}
-	seqKey := device + ":" + v.ID
-	if m.Sequence <= s.sequences[seqKey] {
-		return errors.New("replayed signal")
-	}
-	target := v.TargetID
-	if device == target {
-		target = v.SourceID
-	}
-	p := s.peers[target]
-	if p == nil {
-		return errors.New("peer offline")
-	}
-	raw, _ := json.Marshal(m)
-	select {
-	case p.send <- raw:
-		s.sequences[seqKey] = m.Sequence
-		return nil
-	default:
-		return errors.New("peer backpressure")
+		var msg struct {
+			Type      string          `json:"type"`
+			TargetID  string          `json:"target_id,omitempty"`
+			Payload   json.RawMessage `json:"payload,omitempty"`
+			SessionID string          `json:"session_id,omitempty"`
+		}
+		if json.Unmarshal(raw, &msg) != nil {
+			continue
+		}
+
+		if msg.Type == "heartbeat" {
+			_ = conn.Write(ctx, websocket.MessageText, []byte(`{"type":"heartbeat"}`))
+			continue
+		}
+
+		target := msg.TargetID
+		if target == "" {
+			var subPayload struct {
+				TargetID string `json:"target_id,omitempty"`
+				Session  struct {
+					TargetID string `json:"target_id,omitempty"`
+					SourceID string `json:"source_id,omitempty"`
+				} `json:"session,omitempty"`
+			}
+			if json.Unmarshal(msg.Payload, &subPayload) == nil {
+				if subPayload.TargetID != "" {
+					target = subPayload.TargetID
+				} else if subPayload.Session.TargetID != "" {
+					target = subPayload.Session.TargetID
+					if strings.ReplaceAll(target, " ", "") == normID {
+						target = subPayload.Session.SourceID
+					}
+				}
+			}
+		}
+
+		normTarget := strings.ReplaceAll(strings.TrimSpace(target), " ", "")
+		if normTarget == "" {
+			continue
+		}
+
+		s.mu.Lock()
+		targetPeer := s.peers[normTarget]
+		s.mu.Unlock()
+
+		if targetPeer != nil {
+			select {
+			case targetPeer.send <- raw:
+			default:
+			}
+		} else {
+			offlineMsg, _ := json.Marshal(map[string]any{
+				"type":      "session.updated",
+				"state":     "offline",
+				"reason":    "Remote desk is not online.",
+				"target_id": target,
+			})
+			select {
+			case p.send <- offlineMsg:
+			default:
+			}
+		}
 	}
 }
