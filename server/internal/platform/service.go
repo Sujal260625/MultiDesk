@@ -36,6 +36,7 @@ type Device struct {
 	OwnerID    string    `json:"owner_id"`
 	PublicKey  string    `json:"public_key"`
 	OS         string    `json:"os"`
+	DeviceType string    `json:"device_type"`
 	LastSeen   time.Time `json:"last_seen"`
 	Revoked    bool      `json:"revoked"`
 	Online     bool      `json:"online"`
@@ -258,6 +259,7 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/me", s.auth(s.me))
 	mux.HandleFunc("POST /v1/devices/challenge", s.auth(s.newChallenge))
 	mux.HandleFunc("POST /v1/devices", s.auth(s.registerDevice))
+	mux.HandleFunc("GET /v1/devices/lookup/{code}", s.auth(s.lookupDevice))
 	mux.HandleFunc("GET /v1/devices", s.auth(s.listDevices))
 	mux.HandleFunc("DELETE /v1/devices/{id}", s.auth(s.revokeDevice))
 	mux.HandleFunc("POST /v1/sessions", s.auth(s.requestSession))
@@ -512,15 +514,20 @@ func (s *Service) proof(r *http.Request, user, key string) error {
 }
 func (s *Service) registerDevice(w http.ResponseWriter, r *http.Request, user string) {
 	var q struct {
-		Name      string `json:"name"`
-		PublicKey string `json:"public_key"`
-		OS        string `json:"os"`
+		Name       string `json:"name"`
+		PublicKey  string `json:"public_key"`
+		OS         string `json:"os"`
+		DeviceType string `json:"device_type"`
 	}
 	if !decode(w, r, &q) {
 		return
 	}
-	if len(q.Name) < 1 || len(q.Name) > 80 || (q.OS != "Windows 10" && q.OS != "Windows 11") {
-		fail(w, 400, "device name and supported Windows OS required")
+	if q.DeviceType == "" {
+		q.DeviceType = "pc"
+	}
+	validOS := (q.DeviceType == "pc" && (q.OS == "Windows 10" || q.OS == "Windows 11")) || (q.DeviceType == "android" && q.OS != "")
+	if len(q.Name) < 1 || len(q.Name) > 80 || !validOS {
+		fail(w, 400, "device name and supported OS required")
 		return
 	}
 	s.mu.Lock()
@@ -541,6 +548,7 @@ func (s *Service) registerDevice(w http.ResponseWriter, r *http.Request, user st
 				return
 			}
 			d.Name, d.OS = q.Name, q.OS
+			d.DeviceType = q.DeviceType
 			s.record(user, "device.registration_confirmed", d.ID)
 			sendJSON(w, 200, d)
 			return
@@ -553,7 +561,7 @@ func (s *Service) registerDevice(w http.ResponseWriter, r *http.Request, user st
 		fail(w, 409, "device registration limit reached")
 		return
 	}
-	d := &Device{ID: randomID(12), Name: q.Name, OwnerID: user, PublicKey: q.PublicKey, OS: q.OS}
+	d := &Device{ID: randomID(12), Name: q.Name, OwnerID: user, PublicKey: q.PublicKey, OS: q.OS, DeviceType: q.DeviceType}
 	s.devices[d.ID] = d
 	s.record(user, "device.registered", d.ID)
 	sendJSON(w, 201, d)
@@ -571,6 +579,18 @@ func (s *Service) listDevices(w http.ResponseWriter, r *http.Request, user strin
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	sendJSON(w, 200, out)
+}
+func (s *Service) lookupDevice(w http.ResponseWriter, r *http.Request, user string) {
+	code := r.PathValue("code")
+	code = strings.ReplaceAll(code, " ", "")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d := s.devices[code]
+	if d == nil || d.Revoked {
+		fail(w, 404, "device not found")
+		return
+	}
+	sendJSON(w, 200, map[string]any{"id": d.ID, "name": d.Name, "device_type": d.DeviceType, "online": s.live(d)})
 }
 func (s *Service) revokeDevice(w http.ResponseWriter, r *http.Request, user string) {
 	s.mu.Lock()
@@ -837,7 +857,7 @@ func (s *Service) signalling(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	p := &peer{conn, make(chan []byte, 512)}
+	p := &peer{conn, make(chan []byte, 1024)}
 	s.mu.Lock()
 	if old := s.peers[normID]; old != nil {
 		_ = old.socket.Close(websocket.StatusNormalClosure, "replaced by new session")
